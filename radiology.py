@@ -1,159 +1,76 @@
-import sqlite3
+"""Radiology Medical - demo CLI built on the cpt.py billing engine."""
 
-# 1. Connect to SQL Database (In-Memory for demonstration)
-conn = sqlite3.connect(":memory:")
-cursor = conn.cursor()
-
-# 2. Schema Definition (SQL)
-cursor.executescript("""
-CREATE TABLE cpt_codes (
-    cpt_code TEXT PRIMARY KEY,
-    description TEXT,
-    anatomy TEXT,
-    min_views INTEGER,
-    base_price REAL
-);
-
-CREATE TABLE icd10_codes (
-    icd_code TEXT PRIMARY KEY,
-    description TEXT
-);
-
-CREATE TABLE radiology_claims (
-    claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    patient_id TEXT,
-    cpt_code TEXT,
-    modifier TEXT,
-    icd10_code TEXT,
-    body_side TEXT,
-    FOREIGN KEY(cpt_code) REFERENCES cpt_codes(cpt_code),
-    FOREIGN KEY(icd10_code) REFERENCES icd10_codes(icd_code)
-);
-""")
-
-# 3. Seed Reference Data (SQL INSERTs)
-cursor.executescript("""
-INSERT INTO cpt_codes VALUES 
-    ('71045', 'Chest X-Ray, Single View', 'Chest', 1, 50.00),
-    ('71046', 'Chest X-Ray, 2 Views', 'Chest', 2, 75.00),
-    ('73562', 'Knee X-Ray, 3 Views', 'Knee', 3, 110.00),
-    ('72100', 'Lumbar Spine X-Ray, 2-3 Views', 'Spine', 2, 95.00);
-
-INSERT INTO icd10_codes VALUES 
-    ('R05.9', 'Cough, unspecified'),
-    ('M25.561', 'Pain in right knee'),
-    ('M54.50', 'Low back pain, unspecified');
-""")
-conn.commit()
-
-
-# 4. Helper Functions to Process Claims
-def validate_and_generate_bill(cpt: str, icd10: str, side: str = None, component: str = "GLOBAL") -> dict:
-    """
-    Validates a radiology claim using SQL queries and calculates final reimbursement.
-    
-    component options: 
-      - 'GLOBAL': Full procedure (no modifier)
-      - '26': Professional Component (Radiologist interpretation, 40% of base)
-      - 'TC': Technical Component (Facility/Equipment, 60% of base)
-    """
-    # SQL Query to verify CPT & ICD-10 existence
-    query = """
-    SELECT c.description, c.base_price, i.description 
-    FROM cpt_codes c 
-    CROSS JOIN icd10_codes i 
-    WHERE c.cpt_code = ? AND i.icd_code = ?
-    """
-    cursor.execute(query, (cpt, icd10))
-    result = cursor.fetchone()
-
-    if not result:
-        return {"error": "Invalid CPT or ICD-10 Code"}
-
-    cpt_desc, base_price, icd_desc = result
-
-    # Determine Modifiers & Price Adjustments
-    modifiers = []
-    if side in ["RT", "LT"]:
-        modifiers.append(side)
-
-    multiplier = 1.0
-    if component == "26":
-        modifiers.append("26")
-        multiplier = 0.40  # 40% for Professional
-    elif component == "TC":
-        modifiers.append("TC")
-        multiplier = 0.60  # 60% for Technical
-
-    modifier_str = "-".join(modifiers) if modifiers else "NONE"
-    final_price = round(base_price * multiplier, 2)
-
-    return {
-        "CPT": cpt,
-        "CPT Description": cpt_desc,
-        "ICD-10": icd10,
-        "Diagnosis": icd_desc,
-        "Modifiers": modifier_str,
-        "Billed Amount": f"${final_price:.2f}"
-    }
-
-def record_claim(patient_id: str, cpt: str, modifier: str, icd10: str, side: str):
-    """Inserts a processed claim into the SQL database."""
-    cursor.execute("""
-        INSERT INTO radiology_claims (patient_id, cpt_code, modifier, icd10_code, body_side)
-        VALUES (?, ?, ?, ?, ?)
-    """, (patient_id, cpt, modifier, icd10, side))
-    conn.commit()
-
-
-# 5. Example Executions
-
-# Example 1: Right Knee X-Ray (3 views) - Technical Component Only (Facility Billing)
-claim1 = validate_and_generate_bill(
-    cpt="73562", 
-    icd10="M25.561", 
-    side="RT", 
-    component="TC"
+from cpt import (
+    CPT_TABLES,
+    RadiologyBilling,
+    CptError,
+    calculate_billed_amount,
+    bill_line,
 )
-print("--- Claim 1 (Facility) ---")
-for k, v in claim1.items():
-    print(f"{k}: {v}")
-
-record_claim("PATIENT_001", claim1["CPT"], claim1["Modifiers"], claim1["ICD-10"], "RT")
-
-print("\n")
-
-# Example 2: Chest X-Ray (2 views) - Global Service (Clinic owns machine & physician reads)
-claim2 = validate_and_generate_bill(
-    cpt="71046", 
-    icd10="R05.9", 
-    component="GLOBAL"
-)
-print("--- Claim 2 (Global) ---")
-for k, v in claim2.items():
-    print(f"{k}: {v}")
-
-record_claim("PATIENT_002", claim2["CPT"], claim2["Modifiers"], claim2["ICD-10"], "N/A")
 
 
-# 6. Retrieve Claims with SQL JOIN Query
-print("\n--- All Claims Stored in Database (SQL JOIN) ---")
-sql_report = """
-SELECT 
-    rc.claim_id,
-    rc.patient_id,
-    rc.cpt_code,
-    c.description AS cpt_desc,
-    rc.modifier,
-    rc.icd10_code,
-    i.description AS diagnosis
-FROM radiology_claims rc
-JOIN cpt_codes c ON rc.cpt_code = c.cpt_code
-JOIN icd10_codes i ON rc.icd10_code = i.icd_code
-"""
+def pprint(claim: dict) -> None:
+    for key, value in claim.items():
+        print(f"{key}: {value}")
+    print()
 
-for row in cursor.execute(sql_report):
-    print(row)
 
-# Clean up
-conn.close()
+def main() -> None:
+    billing = RadiologyBilling()
+
+    print("=== Example Bills ===")
+    c1 = billing.generate("XRAY", cpt="73562", icd10="M25.561",
+                          side="RT", component="TC")
+    pprint(c1)
+    c2 = billing.generate("XRAY", cpt="71046", icd10="R05.9",
+                          component="GLOBAL")
+    pprint(c2)
+    c3 = billing.generate("MRI", cpt="70553", icd10="R51.9",
+                          component="GLOBAL")
+    pprint(c3)
+    c4 = billing.generate("MRI", cpt="73721", icd10="M25.562",
+                          side="LT", component="26")
+    pprint(c4)
+
+    print("=== Stored Claims (one-liners) ===")
+    billing.record("XRAY", "73562", "M25.561", "PATIENT_001",
+                   side="RT", component="TC")
+    billing.record("XRAY", "71046", "R05.9", "PATIENT_002",
+                   component="GLOBAL")
+    billing.record("MRI", "70553", "R51.9", "PATIENT_003",
+                   component="GLOBAL")
+    billing.record("MRI", "73721", "M25.562", "PATIENT_004",
+                   side="LT", component="26")
+    for row in billing.report:
+        print(f"#{row['Claim ID']} | {row['Patient']} | {row['Modality']} | "
+              f"{row['CPT']} {row['Description']} | {row['Diagnosis']} | "
+              f"{row['Modifiers']} | ${row['Billed Amount']:.2f}")
+
+    print("\n=== Formula helpers ===")
+    print("Pricing formula example: base $110 at 26 -> "
+          f"${calculate_billed_amount(110.00, '26'):.2f}")
+
+    print("\n=== Validation demo ===")
+    try:
+        bill_line("XRAY", "99999", "R05.9")
+    except CptError as exc:
+        print(f"(Handled) {exc}")
+    try:
+        bill_line("CT", "71046", "R05.9")
+    except CptError as exc:
+        print(f"(Handled) {exc}")
+    try:
+        bill_line("XRAY", "71046", "R05.9", component="99")
+    except CptError as exc:
+        print(f"(Handled) {exc}")
+
+    print("\n=== Available CPTs ===")
+    for modality, table in CPT_TABLES.items():
+        print(f"{modality}:")
+        for record in table:
+            print(f"  {record['cpt_code']} - {record['description']} "
+                  f"(${record['base_price']:.2f})")
+
+
+if __name__ == "__main__":
+    main()
